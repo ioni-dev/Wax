@@ -439,12 +439,13 @@ public actor MemoryOrchestrator {
 
     // MARK: - Recall (Fast RAG)
 
-    public func recall(query: String) async throws -> RAGContext {
+    public func recall(query: String, projectId: Int64? = nil) async throws -> RAGContext {
         let preference: VectorEnginePreference = config.useMetalVectorSearch ? .metalPreferred : .cpuOnly
         let embedding = try await queryEmbedding(for: query, policy: .ifAvailable)
         return try await ragBuilder.build(
             query: query,
             embedding: embedding,
+            projectId: projectId,
             vectorEnginePreference: preference,
             wax: wax,
             session: session,
@@ -452,16 +453,22 @@ public actor MemoryOrchestrator {
         )
     }
 
-    public func recall(query: String, embedding: [Float]) async throws -> RAGContext {
+    public func recall(query: String, embedding: [Float], projectId: Int64? = nil) async throws -> RAGContext {
         let preference: VectorEnginePreference = config.useMetalVectorSearch ? .metalPreferred : .cpuOnly
         return try await ragBuilder.build(
             query: query,
             embedding: embedding,
+            projectId: projectId,
             vectorEnginePreference: preference,
             wax: wax,
             session: session,
             config: config.rag
         )
+    }
+
+    /// Fetches metadata for a specific frame.
+    public func frameMeta(frameId: UInt64) async throws -> FrameMeta {
+        try await wax.frameMetaIncludingPending(frameId: frameId)
     }
 
     public func recall(query: String, embeddingPolicy: QueryEmbeddingPolicy) async throws -> RAGContext {
