@@ -346,13 +346,8 @@ public actor MemoryOrchestrator {
 
     // MARK: - Batch Ingestion (pre-chunked fast path)
     //
-    // ⚠️  CANONICAL SOURCE RULE
-    // Edit ONLY this file in the ioni-dev/Wax fork working tree (Wax_Clone/).
-    // NEVER edit copies under DerivedData/SourcePackages/checkouts/Wax/ or
-    // build-output/SourcePackages/checkouts/Wax/ — those are transient and will
-    // be overwritten by SwiftPM on the next resolve. After editing here, copy
-    // this file to those checkout locations to unblock local builds until the
-    // fork is re-tagged and the Package.resolved pin is updated.
+    // ⚠️  Edit this source in the ioni-dev/Wax fork (Wax_Clone/), commit, and push.
+    // Never edit SwiftPM checkout copies — they are ephemeral caches.
 
     /// Ingest multiple pre-chunked texts in a single embedding pass.
     ///
