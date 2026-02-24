@@ -88,11 +88,8 @@ let package = Package(
                 "WaxCore",
                 "WaxTextSearch",
                 "WaxVectorSearch",
+                "WaxVectorSearchMiniLM",
                 .product(name: "SwiftTiktoken", package: "swift-tiktoken"),
-                .target(
-                    name: "WaxVectorSearchMiniLM",
-                    condition: .when(traits: ["MiniLMEmbeddings"])
-                ),
             ],
             resources: [.process("RAG/Resources")],
             swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]

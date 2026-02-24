@@ -1,6 +1,10 @@
 import Foundation
 import WaxCore
 import WaxVectorSearch
+#if DEBUG
+import os.log
+private let waxPerfLog = Logger(subsystem: "com.wax.library", category: "performance")
+#endif
 
 /// High-level orchestrator for text memory RAG, managing ingest, recall, and lifecycle on a Wax store.
 public actor MemoryOrchestrator {
@@ -340,6 +344,173 @@ public actor MemoryOrchestrator {
         }
     }
 
+    // MARK: - Batch Ingestion (pre-chunked fast path)
+    //
+    // ⚠️  CANONICAL SOURCE RULE
+    // Edit ONLY this file in the ioni-dev/Wax fork working tree (Wax_Clone/).
+    // NEVER edit copies under DerivedData/SourcePackages/checkouts/Wax/ or
+    // build-output/SourcePackages/checkouts/Wax/ — those are transient and will
+    // be overwritten by SwiftPM on the next resolve. After editing here, copy
+    // this file to those checkout locations to unblock local builds until the
+    // fork is re-tagged and the Package.resolved pin is updated.
+
+    /// Ingest multiple pre-chunked texts in a single embedding pass.
+    ///
+    /// Each entry is treated as a pre-chunked, single-chunk document (one document
+    /// frame + one chunk frame), mirroring the write topology of `remember()` for a
+    /// single-chunk input while batching all embeddings into one provider call.
+    ///
+    /// **Invariants** (must hold for every successful call):
+    /// - `vectors.count == entries.count` after the batch embed call.
+    /// - Normalization policy is identical to `remember()`: normalizes iff
+    ///   `embedder.normalize == true`, using the same `normalizedL2` helper.
+    /// - BM25 and vector index are written in the same sequential order as the
+    ///   input `entries` slice (i == 0, 1, …, N-1).
+    /// - `lastWriteActivityAt` is set once at the top, matching `remember()`.
+    ///
+    /// - Precondition: `embedder` must conform to `BatchEmbeddingProvider` when
+    ///   `enableVectorSearch` is true; throws a typed `WaxError` otherwise.
+    /// - Important: On partial failure, callers are responsible for per-item fallback.
+    public func rememberBatch(
+        _ entries: [(text: String, metadata: [String: String])]
+    ) async throws {
+        guard !entries.isEmpty else { return }
+        lastWriteActivityAt = .now
+
+        guard config.enableVectorSearch else {
+            // Text-only path: no embeddings needed.
+            for entry in entries {
+                try await writeSingleEntry(text: entry.text, metadata: entry.metadata, vector: nil)
+            }
+            return
+        }
+
+        guard let localEmbedder = embedder else {
+            throw WaxError.io(
+                "rememberBatch requires an EmbeddingProvider when enableVectorSearch=true (entries.count=\(entries.count))"
+            )
+        }
+        guard let batchEmbedder = localEmbedder as? any BatchEmbeddingProvider else {
+            throw WaxError.io(
+                "rememberBatch requires BatchEmbeddingProvider conformance; \(type(of: localEmbedder)) does not conform (entries.count=\(entries.count))"
+            )
+        }
+
+        // ── Embed phase: single forward pass for all N entries ─────────────
+        let texts = entries.map(\.text)
+        #if DEBUG
+        let embedStart = ContinuousClock.now
+        #endif
+        let rawVectors = try await batchEmbedder.embed(batch: texts)
+        #if DEBUG
+        let embedElapsed = ContinuousClock.now - embedStart
+        let embedMs = embedElapsed.components.seconds * 1_000
+            + embedElapsed.components.attoseconds / 1_000_000_000_000_000
+        #endif
+
+        guard rawVectors.count == entries.count else {
+            throw WaxError.encodingError(
+                reason: "rememberBatch: embed returned \(rawVectors.count) vectors for \(entries.count) entries"
+            )
+        }
+
+        // Normalize using the same policy and helper as remember().
+        // remember() → prepareEmbeddingsBatchOptimized → normalizedL2 iff embedder.normalize.
+        let shouldNormalize = localEmbedder.normalize
+        let cache = embeddingCache
+
+        var vectors = rawVectors
+        if shouldNormalize {
+            for i in vectors.indices where !vectors[i].isEmpty {
+                vectors[i] = Self.normalizedL2(vectors[i])
+            }
+        }
+
+        // Cache using the same key schema as prepareEmbeddingsBatchOptimized.
+        if let cache {
+            var cacheItems: [(key: UInt64, value: [Float])] = []
+            cacheItems.reserveCapacity(texts.count)
+            for (i, text) in texts.enumerated() {
+                let key = EmbeddingKey.make(
+                    text: text,
+                    identity: localEmbedder.identity,
+                    dimensions: localEmbedder.dimensions,
+                    normalized: localEmbedder.normalize
+                )
+                cacheItems.append((key: key, value: vectors[i]))
+            }
+            await cache.setBatch(cacheItems)
+        }
+
+        // ── Write phase: sequential, preserving BM25 + HNSW order ──────────
+        // writeSingleEntry replicates remember()'s write path for a single chunk.
+        #if DEBUG
+        let writeStart = ContinuousClock.now
+        #endif
+        for (i, entry) in entries.enumerated() {
+            try await writeSingleEntry(text: entry.text, metadata: entry.metadata, vector: vectors[i])
+        }
+        #if DEBUG
+        let writeElapsed = ContinuousClock.now - writeStart
+        let writeMs = writeElapsed.components.seconds * 1_000
+            + writeElapsed.components.attoseconds / 1_000_000_000_000_000
+        waxPerfLog.debug(
+            "MemoryOrchestrator.rememberBatch count=\(entries.count) embed_ms=\(embedMs) write_ms=\(writeMs)"
+        )
+        #endif
+    }
+
+    /// Write one pre-chunked entry as a document + single chunk frame pair.
+    ///
+    /// Replicates the write topology of `remember()` for a single-chunk document,
+    /// accepting a pre-computed embedding so no MLX call is made here.
+    private func writeSingleEntry(
+        text: String,
+        metadata: [String: String],
+        vector: [Float]?
+    ) async throws {
+        var docMeta = Metadata(metadata)
+        if let sessionId = currentSessionId {
+            docMeta.entries["session_id"] = sessionId.uuidString
+        }
+
+        let docId = try await session.put(
+            Data(text.utf8),
+            options: FrameMetaSubset(role: .document, metadata: docMeta)
+        )
+
+        var chunkOption = FrameMetaSubset()
+        chunkOption.role = .chunk
+        chunkOption.parentId = docId
+        chunkOption.chunkIndex = 0
+        chunkOption.chunkCount = 1
+        chunkOption.searchText = text
+        var chunkMeta = Metadata(metadata)
+        if let sessionId = currentSessionId {
+            chunkMeta.entries["session_id"] = sessionId.uuidString
+        }
+        chunkOption.metadata = chunkMeta
+
+        let frameIds: [UInt64]
+        if let vector, config.enableVectorSearch {
+            frameIds = try await session.putBatch(
+                contents: [Data(text.utf8)],
+                embeddings: [vector],
+                identity: embedder?.identity,
+                options: [chunkOption]
+            )
+        } else {
+            frameIds = try await session.putBatch(
+                contents: [Data(text.utf8)],
+                options: [chunkOption]
+            )
+        }
+
+        if config.enableTextSearch {
+            try await session.indexTextBatch(frameIds: frameIds, texts: [text])
+        }
+    }
+
     /// Optimized batch embedding preparation with cache-aware batching.
     /// Minimizes cache lookups and maximizes batch embedding efficiency.
     private static func prepareEmbeddingsBatchOptimized(
@@ -439,12 +610,13 @@ public actor MemoryOrchestrator {
 
     // MARK: - Recall (Fast RAG)
 
-    public func recall(query: String) async throws -> RAGContext {
+    public func recall(query: String, projectId: Int64? = nil) async throws -> RAGContext {
         let preference: VectorEnginePreference = config.useMetalVectorSearch ? .metalPreferred : .cpuOnly
         let embedding = try await queryEmbedding(for: query, policy: .ifAvailable)
         return try await ragBuilder.build(
             query: query,
             embedding: embedding,
+            projectId: projectId,
             vectorEnginePreference: preference,
             wax: wax,
             session: session,
@@ -452,16 +624,22 @@ public actor MemoryOrchestrator {
         )
     }
 
-    public func recall(query: String, embedding: [Float]) async throws -> RAGContext {
+    public func recall(query: String, embedding: [Float], projectId: Int64? = nil) async throws -> RAGContext {
         let preference: VectorEnginePreference = config.useMetalVectorSearch ? .metalPreferred : .cpuOnly
         return try await ragBuilder.build(
             query: query,
             embedding: embedding,
+            projectId: projectId,
             vectorEnginePreference: preference,
             wax: wax,
             session: session,
             config: config.rag
         )
+    }
+
+    /// Fetches metadata for a specific frame.
+    public func frameMeta(frameId: UInt64) async throws -> FrameMeta {
+        try await wax.frameMetaIncludingPending(frameId: frameId)
     }
 
     public func recall(query: String, embeddingPolicy: QueryEmbeddingPolicy) async throws -> RAGContext {

@@ -1,5 +1,6 @@
 import Foundation
 import WaxTextSearch
+import WaxCore
 
 public struct RAGContext: Sendable, Equatable {
     public enum ItemKind: Sendable, Equatable { case snippet, expanded, surrogate }
@@ -9,13 +10,15 @@ public struct RAGContext: Sendable, Equatable {
         public var frameId: UInt64
         public var score: Float
         public var sources: [SearchResponse.Source]
+        public var metadata: Metadata?
         public var text: String
 
-        public init(kind: ItemKind, frameId: UInt64, score: Float, sources: [SearchResponse.Source], text: String) {
+        public init(kind: ItemKind, frameId: UInt64, score: Float, sources: [SearchResponse.Source], metadata: Metadata?, text: String) {
             self.kind = kind
             self.frameId = frameId
             self.score = score
             self.sources = sources
+            self.metadata = metadata
             self.text = text
         }
     }

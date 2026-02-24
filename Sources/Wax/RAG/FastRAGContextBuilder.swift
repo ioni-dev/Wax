@@ -15,6 +15,7 @@ public struct FastRAGContextBuilder: Sendable {
     public func build(
         query: String,
         embedding: [Float]? = nil,
+        projectId: Int64? = nil,
         vectorEnginePreference: VectorEnginePreference = .auto,
         wax: Wax,
         session: WaxSession? = nil,
@@ -23,6 +24,13 @@ public struct FastRAGContextBuilder: Sendable {
         let clamped = clamp(config)
         let counter = try await TokenCounter.shared()
 
+        let filter: FrameFilter?
+        if let pid = projectId {
+            filter = FrameFilter(metadataFilter: MetadataFilter(requiredEntries: ["project_id": String(pid)]))
+        } else {
+            filter = nil
+        }
+        
         // 1) Run unified search
         let request = SearchRequest(
             query: query,
@@ -30,6 +38,7 @@ public struct FastRAGContextBuilder: Sendable {
             vectorEnginePreference: vectorEnginePreference,
             mode: clamped.searchMode,
             topK: clamped.searchTopK,
+            frameFilter: filter,
             rrfK: clamped.rrfK,
             previewMaxBytes: clamped.previewMaxBytes
         )
@@ -87,12 +96,16 @@ public struct FastRAGContextBuilder: Sendable {
                     let expandedTokens = await counter.countBatch([expanded])[0]
                     usedTokens += expandedTokens
                     expandedFrameId = result.frameId
+                    
+                    let meta = try? await wax.frameMetaIncludingPending(frameId: result.frameId)
+                    
                     items.append(
                         .init(
                             kind: .expanded,
                             frameId: result.frameId,
                             score: result.score,
                             sources: result.sources,
+                            metadata: meta?.metadata,
                             text: expanded
                         )
                     )
@@ -217,12 +230,18 @@ public struct FastRAGContextBuilder: Sendable {
 
                     guard !capped.isEmpty && tokens <= remainingTokens else { continue }
 
+                    var meta = frameMetaMap[result.frameId]
+                    if meta == nil {
+                        meta = try? await wax.frameMetaIncludingPending(frameId: result.frameId)
+                    }
+                    
                     items.append(
                         .init(
                             kind: .surrogate,
                             frameId: surrogateFrameId,
                             score: result.score,
                             sources: result.sources,
+                            metadata: meta?.metadata,
                             text: capped
                         )
                     )
@@ -304,12 +323,14 @@ public struct FastRAGContextBuilder: Sendable {
 
                     guard !capped.isEmpty && tokens <= remainingTokens else { continue }
 
+                    let meta = try? await wax.frameMetaIncludingPending(frameId: result.frameId)
                     items.append(
                         .init(
                             kind: .snippet,
                             frameId: result.frameId,
                             score: result.score,
                             sources: result.sources,
+                            metadata: meta?.metadata,
                             text: capped
                         )
                     )
